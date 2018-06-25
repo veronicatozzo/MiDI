@@ -1,0 +1,705 @@
+import warnings
+import numpy as np
+
+from sklearn.utils import check_array, check_random_state
+from sklearn.base import BaseEstimator, ClusterMixin, TransformerMixin
+from sklearn.utils.validation import check_is_fitted
+from sklearn.metrics import silhouette_score
+
+from .initialization import _initialize
+from .utils import _check_dimensions_objects2, _get_positive_negative
+
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.metrics import matthews_corrcoef, balanced_accuracy_score
+from sklearn.model_selection import StratifiedShuffleSplit, ParameterGrid
+
+from joblib import Parallel, delayed
+import multiprocessing
+from functools import partial
+
+
+def _to_do_in_parallel(train, test, R={}, y=None, _t=0, Thetas={}):
+    Rtr = dict()
+    Rts = dict()
+    for r in R:
+        if r[0] == _t:
+            Rtr[r] = R[r][train, :]
+            Rts[r] = R[r][test, :]
+        elif r[1] == _t:
+            Rtr[r] = R[r][:, train]
+            Rts[r] = R[r][:, test]
+        else:
+            Rtr[r] = R[r]
+            Rts[r] = R[r]
+
+    Ttr = dict()
+    Tts = dict()
+    for t in Thetas:
+            if t != _t:
+                Ttr[t] = Thetas[t]
+                Tts[t] = Thetas[t]
+            else:
+                Ttr[t] = [Thetas[t][l][train, :]
+                          for l in range(len(Thetas[t]))]
+                Tts[t] = [Thetas[t][l][test, :]
+                          for l in range(len(Thetas[t]))]
+    if y is not None:
+        ytr = y[train, :]
+        yts = y[test, :]
+        estimator.fit(Rtr, ytr, Ttr)
+        return estimator.score(Rts, yts, _t, Tts)
+    else:
+        estimator.fit(Rtr, ytr, Ttr)
+        return estimator.score(Rts, yts, _t, Tts)
+
+
+def _shuffle_split(estimator, R, y, _t,  Thetas=dict(), n_splits=5,
+                   test_size=0.5, n_jobs=1):
+    #t1, t2 = estimator.predictive_relationship
+    dims = _check_dimensions_objects2(R)
+    n = dims[_t]
+    ss = StratifiedShuffleSplit(n_splits=n_splits, test_size=test_size)
+
+    scores = []
+    n_cores = multiprocessing.cpu_count()
+    n_jobs = n_cores if n_jobs == -1 else min(n_jobs, n_cores)
+    func = partial(_to_do_in_parallel, R=R, Thetas=Thetas, y=y, _t=_t)
+    scores = Parallel(n_jobs=num_cores) \
+	     (delayed(func)(train, test) for train, test in ss.split(np.arange(0, n), y
+    return np.mean(scores)
+
+
+def grid_search(estimator, R, grid, y, t,  Thetas=dict(), n_splits=5,
+                test_size=0.3, verbose=0, n_jobs=1):
+        """the grid is a dictionary where for each type its specified a list
+        of possible ranks to consider"""
+        ranks = list(ParameterGrid(grid['ranks']))
+        grid = dict(ranks=ranks, _lambda=grid['_lambda'])
+        params = list(ParameterGrid(grid))
+        best_params = None
+        best_score = - np.inf
+        best_estimator = None
+        results = []
+        for i, p in enumerate(params):
+            estimator.set_params(**p)
+            score = _shuffle_split(estimator, R, y, t, Thetas=Thetas,
+                                   n_splits=n_splits, test_size=test_size,
+                                   n_jobs=1)
+            if verbose:
+                print(p)
+                print("Done iteration %d with schore %4f" % (i, score))
+            results.append([estimator, score])
+            if score > best_score:
+                best_score = score
+                best_params = p
+                best_estimator = estimator
+        return best_estimator, best_params, best_score, results
+
+
+
+def _compute_error(R, G, S):
+    return np.linalg.norm(R - G.dot(S).dot(G.T))/np.linalg.norm(R)
+
+
+def _create_theta(T, types, dimensions):
+    n1 = int(np.sum(dimensions.values()))
+    shift = dict.fromkeys(types, 0)
+    big_T = np.zeros((n1, n1))
+
+    for i, t in enumerate(types[1:]):
+        s_c = shift[types[i]]
+        s_c += dimensions[types[i]]
+        shift[t] = s_c
+
+    for t in T:
+        r_i = shift[t]
+        r_f = shift[t] + dimensions[t]
+        big_T[r_i:r_f, r_i:r_f] = T[t]
+
+    return big_T
+
+
+def _create_R(R, types, dimensions):
+
+    n1 = int(np.sum(dimensions.values()))
+    shift_col = dict.fromkeys(types, 0)
+    shift_row = dict.fromkeys(types, 0)
+
+    for i, t in enumerate(types[1:]):
+        s_c = shift_col[types[i]]
+        s_r = shift_row[types[i]]
+        s_c += dimensions[types[i]]
+        s_r += dimensions[types[i]]
+        shift_col[t] = s_c
+        shift_row[t] = s_r
+    big_R = np.zeros((n1, n1))
+
+    for t in R:
+        t1, t2 = t
+
+        r_i = shift_row[t1]
+        r_f = shift_row[t1] + dimensions[t1]
+        c_i = shift_col[t2]
+        c_f = shift_col[t2] + dimensions[t2]
+
+        big_R[r_i:r_f, c_i:c_f] = R[t]
+
+        r_i = shift_row[t2]
+        r_f = shift_row[t2] + dimensions[t2]
+        c_i = shift_col[t1]
+        c_f = shift_col[t1] + dimensions[t1]
+
+        big_R[r_i:r_f, c_i:c_f] = R[t].T
+    return big_R
+
+
+def _create_G(types, dimensions, ranks, init=None, random_state=None):
+    n1 = int(np.sum(dimensions.values()))
+    n2 = int(np.sum(ranks.values()))
+
+    G = np.zeros((n1, n2))
+    shift_row = 0
+    shift_col = 0
+    for t in types:
+        r = dimensions[t]
+        c = ranks[t]
+        G[shift_row:shift_row+r, shift_col:shift_col+c] = \
+                                                    np.abs(random_state.rand(r, c))
+        shift_row += r
+        shift_col += c
+    return G
+
+
+def _get_Gs(G, types, dimensions, ranks):
+    Gs = dict.fromkeys(types)
+    shift_row = 0
+    shift_col = 0
+    for t in types:
+        r = dimensions[t]
+        c = ranks[t]
+        Gs[t] = G[shift_row:shift_row+r, shift_col:shift_col+c]
+        shift_row += r
+        shift_col += c
+    return Gs
+
+
+def _get_Ss(S, R, types, ranks):
+    Ss = {}
+    shift_col = dict.fromkeys(types, 0)
+    shift_row = dict.fromkeys(types, 0)
+
+    for i, t in enumerate(types[1:]):
+        s_c = shift_col[types[i]]
+        s_r = shift_row[types[i]]
+        s_c += ranks[types[i]]
+        s_r += ranks[types[i]]
+        shift_col[t] = s_c
+        shift_row[t] = s_r
+
+    for t in R:
+        t1, t2 = t
+
+        r_i = shift_row[t1]
+        r_f = shift_row[t1] + ranks[t1]
+        c_i = shift_col[t2]
+        c_f = shift_col[t2] + ranks[t2]
+
+        Ss[t] = S[r_i:r_f, c_i:c_f]
+    return Ss
+
+
+def _update_G(G, R, S, T):
+    RGS_p, RGS_n = _get_positive_negative(R.dot(G).dot(S))
+    SGGS_p, SGGS_n = _get_positive_negative(S.dot(G.T).dot(G).dot(S))
+    t_p, t_n = _get_positive_negative(T)
+
+    num = RGS_p + G.dot(SGGS_n) + t_n.dot(G) + 1e-30
+    denom = RGS_n + G.dot(SGGS_p) + t_p.dot(G) + 1e-30
+    G = G * np.sqrt(num/denom)
+    G = np.nan_to_num(G)
+    return G
+
+
+def _update_S(G, R):
+    GTG_inv = np.linalg.inv(G.T.dot(G))
+    GRG = G.T.dot(R).dot(G)
+    S = GTG_inv.dot(GRG).dot(GTG_inv)
+    return S
+
+
+def _predict(R, Theta, _type, ranks, G, S, G_t, max_iter=100,
+             verbose=0, tol=1e-3, random_state=None):
+
+    obj, err = [], [1e10]
+    thetas_pos, thetas_neg = dict(), dict()
+    for t, thetas_of_t in Theta.items():
+        for theta in thetas_of_t:
+            pos, neg = _get_positive_negative(theta)
+            thetas_pos[t].append(pos)
+            thetas_neg[t].append(neg)
+
+    for _iter in range(max_iter):
+        if verbose > 1:
+            print("Factorization iteration: %d" % _iter)
+
+        G_enum = np.zeros(G_t.shape)
+        G_denom = np.zeros(G_t.shape)
+
+        for r in R:
+            i, j = r
+            if verbose > 1:
+                print("Update G due to R_%s,%s^(%d)" % (i, j))
+
+            if i is _type:
+                tmp1 = np.linalg.multi_dot((R[i, j], G[j],
+                                            S[i, j].T))
+                tmp1p, tmp1n = _get_positive_negative(tmp1)
+                tmp2 = np.linalg.multi_dot((S[i, j], G[j].T, G[j],
+                                            S[i, j].T))
+                tmp2p, tmp2n = _get_positive_negative(tmp2)
+                G_enum += tmp1p + np.dot(G_t, tmp2n)
+                G_denom += tmp1n + np.dot(G_t, tmp2p)
+
+            if j is _type:
+                tmp4 = np.linalg.multi_dot(R[i, j].T, (G[i],
+                                           S[i, j]))
+                tmp4p, tmp4n = _get_positive_negative(tmp4)
+                tmp5 = np.linalg.mulit_dot((S[i, j].T, G[i].T,
+                                            G[i], S[i, j]))
+                tmp5p, tmp5n = _get_positive_negative(tmp5)
+                G_enum += tmp4p + np.dot(G_t, tmp5n)
+                G_denom += tmp4n + np.dot(G_t, tmp5p)
+
+        for r, thetas_p in thetas_pos.items():
+            if r != _type:
+                continue
+            for theta_p in thetas_p:
+                G_denom[r, r] += np.dot(theta_p, G[r])
+
+        for r, thetas_n in thetas_neg.items():
+            if r != _type:
+                continue
+            for theta_n in thetas_n:
+                G_enum += np.dot(theta_n, G_t)
+
+        G_t = np.multiply(G_t, np.sqrt(
+            np.divide(G_enum, np.maximum(G_denom, np.finfo(np.float).eps))))
+
+        s = 0
+        for r in R:
+            i, j = r
+            for l in range(len(R[r])):
+                if i is _type:
+                    Rij_app = np.dot(G_t, np.dot(S[i, j], G[j].T))
+                    r_err = np.linalg.norm(R[r]-Rij_app, "fro")
+                if j is _type:
+                    Rij_app = np.dot(G[i], np.dot(S[i, j], G_t.T))
+                    r_err = np.linalg.norm(R[r]-Rij_app, "fro")
+                if verbose > 1:
+                    print("Relation R_%s,%s^(%d) norm difference: "
+                          "%5.4f" % (i, j, l, r_err))
+                s += r_err
+
+        obj.append(s)
+        err.append(s)
+        if verbose:
+            print("Iter: %d\t obj: %5.4f\t diff_obj: %4f" %
+                  (_iter, s, err[-1] - err[-2]))
+        # convergence check
+        if np.abs(err[-1] - err[-2]) < tol:
+            break
+    else:
+        warnings.warn("The algorithm did not converge", Warning)
+
+    if verbose:
+        print("Violations of optimization objective: %d/%d " % (
+              int(np.sum(np.diff(obj) > 0)), len(obj)))
+    result = dict(G_t=G_t, n_iter=_iter)
+    return result
+
+
+def _tri_smtf(R, T, dimensions, ranks, init=None, max_iter=100, stopping=None,
+              verbose=0, tol=1e-3, callback=None, n_jobs=1, random_state=None):
+
+    err = [1e10]
+
+    if verbose > 1:
+        print("Solving for Theta_p and Theta_n")
+    types = list(dimensions.keys())
+    Rb = _create_R(R, types, dimensions)
+    G = _create_G(types, dimensions, ranks, init=init,
+                  random_state=random_state)
+    Theta = _create_theta(T, types, dimensions)
+    for _iter in range(max_iter):
+        S = _update_S(G, Rb)
+        G = _update_G(G, Rb, S, Theta)
+
+        # Reconstruction error
+        error = _compute_error(Rb, G, S)
+        err.append(error)
+        if verbose:
+            print("Iter: %d\t obj: %5.4f\t diff_obj: %4f" %
+                  (_iter, error, err[-1] - err[-2]))
+        # convergence check
+        if np.abs(err[-1] - err[-2]) < tol:
+            break
+    else:
+        warnings.warn("Algorithm did not converge", Warning)
+
+    if verbose:
+        print("Violations of optimization objective: %d/%d, iter=%d" % (
+                      int(np.sum(np.diff(err) > 0)), len(err), _iter))
+
+    return_ = dict(G=G, S=S, n_iter=_iter)
+    return return_
+
+
+def _transform(R, Theta, _type, ranks, G, S, G_t, max_iter=100,
+               verbose=0, tol=1e-3, random_state=None):
+
+    err = [1e10]
+    # thetas_pos, thetas_neg = dict(), dict()
+    # for t, thetas_of_t in Theta.items():
+    #     for theta in thetas_of_t:
+    #         pos, neg = _get_positive_negative(theta)
+    #         thetas_pos[t].append(pos)
+    #         thetas_neg[t].append(neg)
+
+    for _iter in range(max_iter):
+        if verbose > 1:
+            print("Factorization iteration: %d" % _iter)
+
+        G_enum = np.zeros(G_t.shape)
+        G_denom = np.zeros(G_t.shape)
+
+        for r in R:
+            i, j = r
+            if verbose > 1:
+                print("Update G due to R_%s,%s^(%d)" % (i, j))
+            if i is _type:
+                tmp1 = np.linalg.multi_dot((R[i, j], G[j],
+                                            S[i, j].T))
+                tmp1p, tmp1n = _get_positive_negative(tmp1)
+                assert(np.all(tmp1p >= 0))
+                assert(np.all(tmp1n >= 0))
+                tmp2 = np.linalg.multi_dot((S[i, j], G[j].T, G[j],
+                                            S[i, j].T))
+                tmp2p, tmp2n = _get_positive_negative(tmp2)
+                assert(np.all(tmp2p >= 0))
+                assert(np.all(tmp2n >= 0))
+                G_enum += tmp1p + np.dot(G_t, tmp2n)
+                G_denom += tmp1n + np.dot(G_t, tmp2p)
+
+            if j is _type:
+                tmp4 = np.linalg.multi_dot(R[i, j].T, (G[i],
+                                           S[i, j]))
+                tmp4p, tmp4n = _get_positive_negative(tmp4)
+                assert(np.all(tmp4p >= 0))
+                assert(np.all(tmp4n >= 0))
+                tmp5 = np.linalg.mulit_dot((S[i, j].T, G[i].T,
+                                            G[i], S[i, j]))
+                tmp5p, tmp5n = _get_positive_negative(tmp5)
+                assert(np.all(tmp5p >= 0))
+                assert(np.all(tmp5n >= 0))
+                G_enum += tmp4p + np.dot(G_t, tmp5n)
+                G_denom += tmp4n + np.dot(G_t, tmp5p)
+        #print(G_enum)
+        #print(G_denom)
+        G_enum = np.nan_to_num(G_enum)
+        G_denom[np.where(np.isnan(G_denom))] = np.inf
+        # for r, thetas_p in thetas_pos.items():
+        #     if r != _type:
+        #         continue
+        #     for theta_p in thetas_p:
+        #         G_denom[r] += np.dot(theta_p, G[r])
+        #
+        # for r, thetas_n in thetas_neg.items():
+        #     if r != _type:
+        #         continue
+        #     for theta_n in thetas_n:
+        #         G_enum += np.dot(theta_n, G_t)
+
+        G_t = np.multiply(G_t, np.sqrt(
+            np.divide(G_enum, G_denom)))
+        #print(G_t)
+        s = 0
+        R_norm = 0
+        for r in R:
+            i, j = r
+            if i is _type:
+                Rij_app = np.dot(G_t, np.dot(S[i, j], G[j].T))
+                r_err = np.linalg.norm(R[r]-Rij_app, "fro")
+                R_norm += np.linalg.norm(R[r])
+            if j is _type:
+                Rij_app = np.dot(G[i, i], np.dot(S[i, j], G_t.T))
+                r_err = np.linalg.norm(R[r]-Rij_app, "fro")
+                R_norm += np.linalg.norm(R[r])
+            if verbose > 1:
+                print("Relation R_%s,%s^(%d) norm difference: "
+                      "%5.4f" % (i, j,  r_err))
+            s += r_err
+        break
+        s /= R_norm
+        err.append(s)
+        if verbose:
+            print("Iter: %d\t obj: %5.4f\t diff_obj: %4f" %
+                  (_iter, s, err[-1] - err[-2]))
+        # convergence check
+        if np.abs(err[-1] - err[-2]) < tol:
+            break
+    else:
+        warnings.warn("The algorithm did not converge", Warning)
+
+    if verbose:
+        print("Violations of optimization objective: %d/%d " % (
+              int(np.sum(np.diff(err) > 0)), len(err)))
+    result = dict(G_t=G_t, n_iter=_iter)
+    return result
+
+
+class tri_SMTF(BaseEstimator, ClusterMixin, TransformerMixin):
+    """
+    max_iter: int, optional, default:200
+        Maximum number of iteration for the fit function
+
+    init: string, optional default:'kmeans'
+        Method of initialization of the Gs matrices.
+        Options:
+            - kmeans
+
+    tol: float, optional default: 1e-3
+
+    stopping: tuple, optional default=None
+
+    n_jobs: int, optional default=1
+
+    verbose: int, optional
+        If the fit function gives output
+
+    random_state: int or numpy.RandomState
+    """
+
+    def __init__(self, ranks, _lambda, _type, max_iter=200, init='kmeans', tol=1e-3,
+                 stopping=None, n_jobs=1, verbose=0, random_state=None):
+        self.ranks = ranks
+        self._lambda = _lambda
+        self._type = _type
+        self.max_iter = max_iter
+        self.init = init
+        self.verbose = verbose
+        self.random_state = random_state
+        self.stopping = stopping
+        self.tol = tol
+        self.n_jobs = n_jobs
+
+    def _check_fit_data(self, X):
+        """Verify that the number of samples given is larger than k"""
+        for r in X:
+            X[r] = check_array(X[r], accept_sparse='csr',
+                               dtype=[np.float64, np.float64])
+            if X[r].shape[0] < self.n_clusters[r[0]]:
+                raise ValueError("n_samples=%d should be >= n_clusters=%d"
+                                 % (X[r].shape[0],
+                                    self.n_clusters[r[0]]))
+            if X[r].shape[1] < self.n_clusters[r[1]]:
+                raise ValueError("n_samples=%d should be >= n_clusters=%d"
+                                 % (X[r].shape[1],
+                                    self.n_clusters[r[1]]))
+        return X
+
+    def _check_ranks(self, types):
+        for t in types:
+            if self.ranks.get(t) is None:
+                ValueError("Missin the rank of the type %s" % t)
+        return self.ranks
+
+    def _get_clusters(self, Gs=None):
+        if Gs is None:
+            Gs = self.G_
+        if isinstance(Gs, dict):
+            clusters = dict()
+            clusters_centers_kmeans = dict.fromkeys(Gs.keys(), dict())
+            clusters_centers = dict.fromkeys(Gs.keys(), dict())
+            for k in Gs.keys():
+                G = Gs[k]
+                clusters[k] = np.argmax(G, axis=1)
+                for r in self.Rs:
+                    t1, t2 = r
+                    if k == t1:
+                        clusters_centers[k][t2] = self.S_[k, t2].dot(Gs[t2].T)
+                        centers = []
+                        for l in np.unique(clusters[k]):
+                            centers.append(np.mean(self.Rs[r][np.where(clusters[k] == l), :], axis=1))
+                        clusters_centers_kmeans[k][t2] = np.array(centers)
+            return clusters, clusters_centers, clusters_centers_kmeans
+        else:
+            clusters = np.argmax(Gs, axis=1)
+            return clusters
+
+    def fit(self, Rs, y, Thetas=dict()):
+        """
+
+        :param Rs:
+        :param ranks:
+        :param Thetas:
+        :return:
+        """
+
+        dimensions = _check_dimensions_objects2(Rs)
+        types = list(dimensions.keys())
+        ranks = self._check_ranks(types)
+        self.n_clusters = ranks
+        self.Rs = self._check_fit_data(Rs)
+        self.random_state = check_random_state(self.random_state)
+
+        _result = _tri_smtf(self.Rs, Thetas, dimensions, ranks,
+                            init=self.init, max_iter=self.max_iter,
+                            verbose=self.verbose, tol=self.tol,
+                            random_state=self.random_state)
+        self.G_ = _get_Gs(_result['G'], types, dimensions, ranks)
+        self.S_ = _get_Ss(_result['S'], Rs, types, ranks)
+        self.n_iter_ = _result['n_iter']
+        self.labels_, self.cluster_centers_, self.cluster_centers_kmeans_ =\
+            self._get_clusters()
+        #print(self.labels_)
+        self.ranks = ranks
+        self.lr = LogisticRegressionCV(Cs=np.logspace(-3, 1, 10))
+        self.lr.fit(self.G_[self._type], y)
+        labels_ = self.lr.predict(self.G_[self._type])
+        print(balanced_accuracy_score(y, labels_))
+        self.y = y
+        return self
+
+    def fit_predict(self, Rs, Thetas=dict()):
+        """Compute cluster centers and predict cluster index for each sample.
+        Convenience method; equivalent to calling fit(X) followed by
+        predict(X).
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape = [n_samples, n_features]
+            New data to transform.
+        y : Ignored
+        Returns
+        -------
+        labels : array, shape [n_samples,]
+            Index of the cluster each sample belongs to.
+        """
+        return self.fit(Rs, Thetas).labels_
+
+    def predict(self, Rs,  _type, Thetas=dict()):
+        """Predict the clusters of each sample of type _type in Rs.
+
+        Parameters
+        ----------
+        :param Rs:
+        :param Thetas:
+        :param _type:
+        :return:
+        Returns
+        -------
+        labels : array, shape [n_samples,]
+            Index of the cluster each sample belongs to.
+        """
+        check_is_fitted(self, 'labels_')
+        targets = []
+        for i, j in Rs:
+            entry = 0 if _type == i else 1
+            targets.append(Rs[i, j].shape[entry])
+
+        if len(set(targets)) > 1:
+            warnings.warn("Target object type: %s size mismatch" % _type,
+                          Warning)
+
+        targets = targets[0]
+        dimensions = _check_dimensions_objects2(Rs)
+        types = dimensions.keys()
+        Gx = _create_G(types, dimensions, self.ranks,
+                       random_state=self.random_state)
+        G_t = _get_Gs(Gx, types, dimensions, self.ranks)
+        G_t = G_t.get(_type)
+
+        _result = _predict(Rs, Thetas, _type, ranks=self.ranks, G=self.G_,
+                           S=self.S_, G_t=G_t, max_iter=self.max_iter,
+                           verbose=self.verbose, tol=self.tol,
+                           random_state=self.random_state)
+
+        return self.lr.predict(_result['G_t'])
+
+    def transform(self, Rs, Thetas, _type):
+        """Transform X to a cluster-distance space.
+        In the new space, each dimension is the distance to the cluster
+        centers.  Note that even if X is sparse, the array returned by
+        `transform` will typically be dense.
+        Parameters
+        ----------
+        X : {array-like, sparse matrix}, shape = [n_samples, n_features]
+            New data to transform.
+        Returns
+        -------
+        X_new : array, shape [n_samples, k]
+            X transformed in the new space.
+        """
+        check_is_fitted(self, 'labels_')
+        targets = []
+        for i, j in Rs:
+            entry = 0 if _type == i else 1
+            targets.append(Rs[i, j][0].shape[entry])
+
+        if len(set(targets)) > 1:
+            warnings.warn("Target object type: %s size mismatch" % _type,
+                          Warning)
+
+        targets = targets[0]
+        dimensions = _check_dimensions_objects2(Rs)
+        G_t = np.abs(self.random_state.randn(dimensions[_type],
+                     self.ranks[_type]))
+        #print(G_t)
+        _result = _transform(Rs, Thetas, _type, ranks=self.ranks, G=self.G_,
+                             S=self.S_, G_t=G_t, max_iter=self.max_iter,
+                             verbose=self.verbose, tol=self.tol,
+                             random_state=self.random_state)
+
+        return _result['G_t']
+
+    def score(self, Rs=None, y=None, _type=None, Thetas=dict()):
+        """Opposite of the value of X on the K-means objective.
+        Parameters
+        ----------
+        Rs :
+        Thetas :
+        _type:
+        Returns
+        -------
+        score : float
+            Opposite of the value of X on the K-means objective.
+        """
+        #print("ENTRO QUI")
+        check_is_fitted(self, 'labels_')
+        if Rs is None:
+            labels = self.prediction = self.logisticRegressionEstimator.predict(
+                self.G_[self._type])
+            Rs = self.Rs
+        else:
+            #Rs = self._check_fit_data(Rs)
+            labels = self.predict(Rs, _type, Thetas)
+
+        if y is None:
+            y = self.y
+
+        if len(np.unique(labels).ravel()) == 1:
+            #print("bananarama")
+            return 0
+        #print("spno qui")
+        return balanced_accuracy_score(y, labels)
+        # total_relations = 0
+        # silhouette = 0
+        # print(labels)
+        # for r in Rs:
+        #     if r[0] == _type:
+        #         silhouette += silhouette_score(Rs[r], labels)
+        #         total_relations += 1
+        #     elif r[1] == _type:
+        #         silhouette += silhouette_score(Rs[r].T, labels)
+        #         total_relations += 1
+        # silhouette /= total_relations
+        # return silhouette
