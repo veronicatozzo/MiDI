@@ -10,20 +10,23 @@ import numpy as np
 from ..base import ClassifierMixin
 from ..externals.joblib import Parallel, delayed
 
-
+from sklearn.utils import check_array, check_consistent_length
 from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_is_fitted
 
 __all__ = []
 
 
+def _fit_ensemble_rls(X, y, alphas, l1_ratios, )
+
 class EnsembleClassifier(ClassifierMixin):
     """Base class for Ensemble classifier.
     """
 
-    def __init__(self, estimators='RLS', n_estimators=10,
+    def __init__(self, estimators='RLS',
                  estimator_params=tuple(), n_jobs=1, random_state=None,
                  verbose=0, class_weight=None):
+
         self.estimators = estimators
         self.n_estimators = n_estimators
         self.estimator_params = estimator_params
@@ -45,7 +48,26 @@ class EnsembleClassifier(ClassifierMixin):
             raise ValueError("The estimator works only on 2-classes scenarios")
         return y
 
-    def fit(self, X, y, )
+    def fit(self, X, y):
+        """
+        X: list of array, length D, shape of each array i
+            (n_samples, n_features_i).
+            The list of different datasets to use for the prediction of the
+            output y.
+        y: array-like, shape=(n_samples, )
+        
+        """
+        X = check_array(X)
+        y = self._validate_y_class_weight(y)
+        check_consistent_length(X, y)
+
+        if estimators.lower() != 'elasticnet':
+            warnings.warn("Estimators different than ElasticNet are not "
+                          "allowed.")
+            sys.exit(0)
+
+
+
     def predict(self, X):
         """Predict class for X.
         The predicted class of an input sample is a vote by the trees in

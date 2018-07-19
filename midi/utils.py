@@ -6,12 +6,13 @@ import sys
 import numpy as np
 import pandas as pd
 
-from sklearn.utils import check_array, _check_consistency_with_train
+from sklearn.utils import check_array, check_consistent_length
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.svm import LinearSVC
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedShuffleSplit
-from sklearn.model_selection import GridSearchCV, balanced_accuracy_score
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import balanced_accuracy_score
 
 param_name = {'ridge': 'alpha',
               'svm': 'C',
@@ -31,6 +32,7 @@ def _get_parameters(model, params=np.logspace(-10, 10, 50)):
                       "integers representing the number of estimators used."
                       "Casting the vector to int.")
         params = params.astype(int)
+        params = params[np.where(params != 0)]
     return {par: params}
 
 
@@ -56,7 +58,7 @@ def benchmark_with_multiple_models(
         verbose=0,
         filename='results.pkl'):
     """
-    Function that given a dataset test it with multiple models to check its
+    Function that given a dataset tests it with multiple models to check its
     performance in classifying y.
 
     Params
@@ -89,7 +91,7 @@ def benchmark_with_multiple_models(
     """
 
     X = check_array(X)
-    _check_consistency_with_train(X, y)
+    check_consistent_length(X, y)
 
     if len(params_range) == 1:
         params_range = [params_range]*len(models)
@@ -114,13 +116,9 @@ def benchmark_with_multiple_models(
         if model is None or params is None:
             continue
 
-        tr_scores = []
-        estimators = []
-        trains_idx = []
-        test_idx = []
-        ts_scores = []
-        parameters = []
-        val_scores = []
+        tr_scores, estimators, trains_idx, test_idx = [], [], [], []
+        ts_scores, parameters, val_scores = [], [], []
+
         sss = StratifiedShuffleSplit(n_splits=n_of_repetitions)
 
         for train, test in sss.split(X, y):
@@ -128,7 +126,6 @@ def benchmark_with_multiple_models(
             y_tr = y[train]
             x_ts = X[test, :]
             y_ts = y[test]
-            model = RandomForestClassifier()
             gscv = GridSearchCV(model, params, cv=n_split_for_cv)
             gscv.fit(x_tr, y_tr)
             model = gscv.best_estimator_

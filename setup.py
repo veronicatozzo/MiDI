@@ -7,15 +7,13 @@ Licensed under the BSD 3-Clause License (see LICENSE.txt).
 """
 
 from setuptools import setup, find_packages
-# import numpy as np
 
 # Package Version
-from regain import __version__ as version
-# alignment_module = Extension('icing.align.align',
-#                              sources=['icing/align/alignment.c'])
+#from midi import __version__ as version
+#
 setup(
-    name='regain',
-    version=version,
+    name='MiDI',
+    #version=version,
 
     description=('MiDI (Methods for Data Integration)'),
     long_description=open('README.md').read(),
@@ -24,9 +22,9 @@ setup(
     maintainer='Veronica Tozzo',
     maintainer_email='veronica.tozzo@dibris.unige.it',
     url='https://github.com/veronicatozzo/inning',
-    download_url='https://github.com/veronicatozzo/inning/archive/'
-                 'v%s.tar.gz' % version,
-    keywords=['data integration'. 'clustering', 'classification'],
+    #download_url='https://github.com/veronicatozzo/inning/archive/'
+    #             'v%s.tar.gz' % version,
+    keywords=['data integration', 'clustering', 'classification'],
     classifiers=[
         'Development Status :: 1 - Beta',
         'Environment :: Console',
