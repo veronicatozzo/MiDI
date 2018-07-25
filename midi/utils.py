@@ -13,11 +13,47 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import balanced_accuracy_score
+from collections import namedtuple
+
+
+convergence = namedtuple('convergence',
+                         ('obj', 'iter_diff', 'results'))
+
 
 param_name = {'ridge': 'alpha',
               'svm': 'C',
               'logisticregression': 'C',
               'randomforest': 'n_estimators'}
+
+
+def soft_thresholding(x, lamda):
+    """Soft-thresholding for vectors."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return np.maximum(0, 1 - lamda / np.linalg.norm(x)) * x
+
+
+def prox_elastic_net(x, tau, mu):
+    return (1/(1+mu))*soft_thresholding(x, tau)
+
+
+def prox_l2_el(w, X, y, tau, mu, gamma, max_iters=200):
+
+    z = np.random.rand(*w.shape)
+    step = 1e-10
+    for i in range(max_iters):
+        z_old = z.copy()
+        #print(z)
+        grad = -X.T.dot(y - X.dot(z)) + mu*z + (z-w)/gamma
+        #print(step*grad)
+        z = soft_thresholding(z - step*grad, tau*step)
+
+        if np.linalg.norm(z_old - z) < 1e-5:
+            break
+    else:
+        print(z)
+        warnings.warn("The proximal algorithm did not converge")
+    return z
 
 
 def _get_parameters(model, params=np.logspace(-10, 10, 50)):
@@ -126,8 +162,10 @@ def benchmark_with_multiple_models(
             y_tr = y[train]
             x_ts = X[test, :]
             y_ts = y[test]
-            gscv = GridSearchCV(model, params, cv=n_split_for_cv)
+            print("sono qui")
+            gscv = GridSearchCV(model, params, iid=False, cv=n_split_for_cv)
             gscv.fit(x_tr, y_tr)
+            print("sono li")
             model = gscv.best_estimator_
             parameters.append(gscv.best_params_[param_name[m.lower()]])
             val_scores.append(gscv.cv_results_)
